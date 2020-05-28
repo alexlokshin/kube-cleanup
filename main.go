@@ -3,12 +3,15 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+
+	"github.com/urfave/cli/v2"
 
 	"github.com/cheggaaa/pb"
 	"gopkg.in/yaml.v2"
@@ -18,12 +21,16 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+type ResourceReference struct {
+	Name string `json:",omitempty"`
+	Kind string `json:",omitempty"`
+}
+
 type OrphanReason struct {
-	Name          string `json:",omitempty"`
-	Kind          string `json:",omitempty"`
-	Reference     string `json:",omitempty"`
-	ReferenceKind string `json:",omitempty"`
-	Reason        string `json:",omitempty"`
+	Name      string            `json:",omitempty"`
+	Kind      string            `json:",omitempty"`
+	Reference ResourceReference `json:",omitempty"`
+	Reason    string            `json:",omitempty"`
 }
 type OrphanList struct {
 	Pods      map[string]OrphanReason `json:",omitempty"`
@@ -31,9 +38,9 @@ type OrphanList struct {
 }
 
 type Namespace struct {
-	Name      string          `json:",omitempty"`
-	Pods      *[]OrphanReason `json:",omitempty"`
-	Ingresses *[]OrphanReason `json:",omitempty"`
+	Name      string         `json:",omitempty"`
+	Pods      []OrphanReason `json:",omitempty"`
+	Ingresses []OrphanReason `json:",omitempty"`
 }
 
 type NamespaceList struct {
@@ -58,18 +65,62 @@ func homeDir() string {
 func main() {
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
-	var kubeconfig *string
-	var outputMode *string
+	var kubeconfig string
+	var outputMode string
 	home := homeDir()
+	kubeConfigPath := ""
 	if home != "" {
-		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	} else {
-		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+		kubeConfigPath = filepath.Join(home, ".kube", "config")
 	}
-	outputMode = flag.String("o", "text", "output mode (json,yaml,text)")
-	flag.Parse()
 
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	app := &cli.App{
+		Name:  "kube-cleanup",
+		Usage: "kubernetes garbage collector",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "kubeconfig",
+				Value:       kubeConfigPath,
+				Usage:       "absolute path to the kubeconfig file",
+				Destination: &kubeconfig,
+			},
+			&cli.StringFlag{
+				Name:        "o",
+				Aliases:     []string{"output"},
+				Value:       "yaml",
+				Usage:       "output format (yaml, json, kubectl)",
+				Destination: &outputMode,
+			},
+		},
+		Commands: []*cli.Command{
+			{
+				Name:    "list",
+				Aliases: []string{"ls"},
+				Usage:   "list orphans",
+				Action: func(c *cli.Context) error {
+					run(kubeconfig, outputMode)
+					return nil
+				},
+			},
+		},
+		Action: func(c *cli.Context) error {
+			fmt.Println("For usage, run ./kube-cleanup -?")
+
+			return errors.New("Command not specified")
+		},
+	}
+
+	sort.Sort(cli.FlagsByName(app.Flags))
+	sort.Sort(cli.CommandsByName(app.Commands))
+
+	err := app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+}
+
+func run(kubeconfig string, outputMode string) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Println("Local configuration not found, trying in-cluster configuration.")
 		config, err = rest.InClusterConfig()
@@ -121,7 +172,7 @@ func main() {
 					if orphanList.Ingresses == nil {
 						orphanList.Ingresses = make(map[string]OrphanReason)
 					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service", Kind: "ingress", ReferenceKind: "service", Reference: serviceName, Name: ingress.Name}
+					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service", Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
 					orphans[ingress.Namespace] = orphanList
 
 					continue
@@ -154,7 +205,7 @@ func main() {
 					if orphanList.Pods == nil {
 						orphanList.Pods = make(map[string]OrphanReason)
 					}
-					orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner is missing", Name: pod.Name, Kind: "pod", ReferenceKind: ownerReference.Kind, Reference: ownerReference.Name}
+					orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner is missing", Name: pod.Name, Kind: "pod", Reference: ResourceReference{Kind: ownerReference.Kind, Name: ownerReference.Name}}
 					orphans[pod.Namespace] = orphanList
 
 					continue
@@ -167,7 +218,7 @@ func main() {
 								if orphanList.Pods == nil {
 									orphanList.Pods = make(map[string]OrphanReason)
 								}
-								orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, ReferenceKind: "deployment", Reference: ownerReference.Name}
+								orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, Reference: ResourceReference{Kind: "deployment", Name: ownerReference.Name}}
 								orphans[pod.Namespace] = orphanList
 							}
 						}
@@ -188,19 +239,23 @@ func main() {
 
 	namespaceList := NamespaceList{}
 	for namespace, orphanList := range orphans {
-		ns := Namespace{Name: namespace}
-		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
+		orphanedIngresses := make([]OrphanReason, 0)
+		orphanedPods := make([]OrphanReason, 0)
 
 		for _, reason := range orphanList.Ingresses {
-			*ns.Ingresses = append(*ns.Ingresses, reason)
+			orphanedIngresses = append(orphanedIngresses, reason)
 		}
 
 		for _, reason := range orphanList.Pods {
-			*ns.Pods = append(*ns.Pods, reason)
+			orphanedPods = append(orphanedPods, reason)
 		}
+
+		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
+		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
+
 	}
 
-	if "text" == *outputMode {
+	if "text" == outputMode {
 		for namespace, orphanList := range orphans {
 			fmt.Printf("\n==============================\n")
 			fmt.Printf("Namespace: %s\n", namespace)
@@ -219,13 +274,13 @@ func main() {
 			}
 			fmt.Println()
 		}
-	} else if "yaml" == *outputMode {
+	} else if "yaml" == outputMode {
 		pretty, err := yaml.Marshal(&namespaceList)
 		if err != nil {
 			betterPanic(err.Error())
 		}
 		fmt.Println(string(pretty))
-	} else if "json" == *outputMode {
+	} else if "json" == outputMode {
 		pretty, err := json.MarshalIndent(namespaceList, "", "    ")
 		if err != nil {
 			betterPanic(err.Error())

@@ -6,6 +6,7 @@ require (
 	github.com/cheggaaa/pb v2.0.7+incompatible
 	github.com/mattn/go-colorable v0.1.2 // indirect
 	github.com/mattn/go-isatty v0.0.10 // indirect
+	github.com/urfave/cli/v2 v2.2.0
 	golang.org/x/sys v0.0.0-20191128015809-6d18c012aee9 // indirect
 	gopkg.in/VividCortex/ewma.v1 v1.1.1 // indirect
 	gopkg.in/cheggaaa/pb.v2 v2.0.7 // indirect
