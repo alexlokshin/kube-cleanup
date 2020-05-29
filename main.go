@@ -252,39 +252,42 @@ func run(kubeconfig string, outputMode string) {
 
 		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
 		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
-
 	}
 
-	if "text" == outputMode {
-		for namespace, orphanList := range orphans {
-			fmt.Printf("\n==============================\n")
-			fmt.Printf("Namespace: %s\n", namespace)
-			fmt.Printf("==============================\n")
-			if len(orphanList.Pods) > 0 {
-				fmt.Printf("\nOrphaned Pods\n")
-				for pod, reason := range orphanList.Pods {
-					fmt.Printf("* %s, %s\n", pod, reason)
+	if len(orphans) == 0 {
+		fmt.Printf("You don't have any problems, at all!\n")
+	} else {
+		if "text" == outputMode {
+			for namespace, orphanList := range orphans {
+				fmt.Printf("\n==============================\n")
+				fmt.Printf("Namespace: %s\n", namespace)
+				fmt.Printf("==============================\n")
+				if len(orphanList.Pods) > 0 {
+					fmt.Printf("\nOrphaned Pods\n")
+					for pod, reason := range orphanList.Pods {
+						fmt.Printf("* %s, %s\n", pod, reason)
+					}
 				}
-			}
-			if len(orphanList.Ingresses) > 0 {
-				fmt.Printf("\nOrphaned Ingresses\n")
-				for ingress, reason := range orphanList.Ingresses {
-					fmt.Printf("* %s, %s\n", ingress, reason)
+				if len(orphanList.Ingresses) > 0 {
+					fmt.Printf("\nOrphaned Ingresses\n")
+					for ingress, reason := range orphanList.Ingresses {
+						fmt.Printf("* %s, %s\n", ingress, reason)
+					}
 				}
+				fmt.Println()
 			}
-			fmt.Println()
+		} else if "yaml" == outputMode {
+			pretty, err := yaml.Marshal(&namespaceList)
+			if err != nil {
+				betterPanic(err.Error())
+			}
+			fmt.Println(string(pretty))
+		} else if "json" == outputMode {
+			pretty, err := json.MarshalIndent(namespaceList, "", "    ")
+			if err != nil {
+				betterPanic(err.Error())
+			}
+			fmt.Println(string(pretty))
 		}
-	} else if "yaml" == outputMode {
-		pretty, err := yaml.Marshal(&namespaceList)
-		if err != nil {
-			betterPanic(err.Error())
-		}
-		fmt.Println(string(pretty))
-	} else if "json" == outputMode {
-		pretty, err := json.MarshalIndent(namespaceList, "", "    ")
-		if err != nil {
-			betterPanic(err.Error())
-		}
-		fmt.Println(string(pretty))
 	}
 }
