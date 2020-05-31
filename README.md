@@ -20,3 +20,15 @@ Tool will alert you if the route is not traversible and there's nothing on the o
 ## Cleanup
 
 ## Integrity checks
+
+
+## TODOs
+* Add sample invalid resources
+* Reduce validation loops. For ingresses only make sure services exist. Loop through services separately, making sure their workloads exist.
+* For Deployments/DaemonSets etc make sure pods not only exist, but are running. If not a single pod was running for a while, report on the workload.
+* Validate resource versions
+* Help with the annotation validation
+* kubernetes.io/ingress.class annotation migrated to spec.ingressClassName and ingressClass resources
+* For LoadBalancer services, report if the actual LB creation took too long.
+* Complain about services without a selector (unless that's an externalname service)
+* For externalname service complain, if it points to an IP address and not a CNAME
