@@ -16,35 +16,36 @@ import (
 	"github.com/cheggaaa/pb"
 	"gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 type ResourceReference struct {
-	Name string `json:",omitempty"`
-	Kind string `json:",omitempty"`
+	Name string `json:",omitempty" yaml:",omitempty"`
+	Kind string `json:",omitempty" yaml:",omitempty"`
 }
 
 type OrphanReason struct {
-	Name      string            `json:",omitempty"`
-	Kind      string            `json:",omitempty"`
-	Reference ResourceReference `json:",omitempty"`
-	Reason    string            `json:",omitempty"`
+	Name      string            `json:",omitempty" yaml:",omitempty"`
+	Kind      string            `json:",omitempty" yaml:",omitempty"`
+	Reference ResourceReference `json:",omitempty" yaml:",omitempty"`
+	Reason    string            `json:",omitempty" yaml:",omitempty"`
 }
 type OrphanList struct {
-	Pods      map[string]OrphanReason `json:",omitempty"`
-	Ingresses map[string]OrphanReason `json:",omitempty"`
+	Pods      map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Ingresses map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type Namespace struct {
-	Name      string         `json:",omitempty"`
-	Pods      []OrphanReason `json:",omitempty"`
-	Ingresses []OrphanReason `json:",omitempty"`
+	Name      string         `json:",omitempty" yaml:",omitempty"`
+	Pods      []OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Ingresses []OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type NamespaceList struct {
-	Namespaces []Namespace `json:",omitempty"`
+	Namespaces []Namespace `json:",omitempty" yaml:",omitempty"`
 }
 
 var inCluster bool
@@ -166,17 +167,65 @@ func run(kubeconfig string, outputMode string) {
 			for _, path := range rule.HTTP.Paths {
 
 				serviceName := path.Backend.ServiceName
-				_, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
+				servicePort := path.Backend.ServicePort.IntVal
+				service, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
 				if err != nil {
 					orphanList := orphans[ingress.Namespace]
 					if orphanList.Ingresses == nil {
 						orphanList.Ingresses = make(map[string]OrphanReason)
 					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service", Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
 					orphans[ingress.Namespace] = orphanList
 
 					continue
 				}
+
+				found := false
+				for _, port := range service.Spec.Ports {
+					if port.Port == servicePort {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					orphanList := orphans[ingress.Namespace]
+					if orphanList.Ingresses == nil {
+						orphanList.Ingresses = make(map[string]OrphanReason)
+					}
+					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+					orphans[ingress.Namespace] = orphanList
+
+					continue
+				}
+
+				listOptions := metav1.ListOptions{}
+				listOptions.LabelSelector = labels.SelectorFromSet(service.Spec.Selector).String()
+
+				podList, err := clientset.CoreV1().Pods(ingress.Namespace).List(listOptions)
+
+				if err != nil {
+					orphanList := orphans[ingress.Namespace]
+					if orphanList.Ingresses == nil {
+						orphanList.Ingresses = make(map[string]OrphanReason)
+					}
+					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+					orphans[ingress.Namespace] = orphanList
+
+					continue
+				}
+
+				if len(podList.Items) == 0 {
+					orphanList := orphans[ingress.Namespace]
+					if orphanList.Ingresses == nil {
+						orphanList.Ingresses = make(map[string]OrphanReason)
+					}
+					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing workload contains no pods", Kind: "ingress", Reference: ResourceReference{Kind: "pods", Name: listOptions.LabelSelector}, Name: ingress.Name}
+					orphans[ingress.Namespace] = orphanList
+
+					continue
+				}
+
 			}
 		}
 	}
