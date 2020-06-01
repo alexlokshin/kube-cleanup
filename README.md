@@ -24,6 +24,7 @@ Tool will alert you if the route is not traversible and there's nothing on the o
 
 ## TODOs
 * Add sample invalid resources
+* Transition to a configuration model
 * Reduce validation loops. For ingresses only make sure services exist. Loop through services separately, making sure their workloads exist.
 * For Deployments/DaemonSets etc make sure pods not only exist, but are running. If not a single pod was running for a while, report on the workload.
 * Validate resource versions
@@ -32,3 +33,4 @@ Tool will alert you if the route is not traversible and there's nothing on the o
 * For LoadBalancer services, report if the actual LB creation took too long.
 * Complain about services without a selector (unless that's an externalname service)
 * For externalname service complain, if it points to an IP address and not a CNAME
+* Fix namespaces stuck in terminating state

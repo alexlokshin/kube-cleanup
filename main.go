@@ -14,7 +14,9 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/cheggaaa/pb"
+	isd "github.com/jbenet/go-is-domain"
 	"gopkg.in/yaml.v2"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -63,11 +65,77 @@ func homeDir() string {
 	return os.Getenv("USERPROFILE") // windows
 }
 
+func contains(s string, array []string) bool {
+	for _, v := range array {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func printReport(orphans map[string]OrphanList, outputMode string) {
+	namespaceList := NamespaceList{}
+	for namespace, orphanList := range orphans {
+		orphanedIngresses := make([]OrphanReason, 0)
+		orphanedPods := make([]OrphanReason, 0)
+
+		for _, reason := range orphanList.Ingresses {
+			orphanedIngresses = append(orphanedIngresses, reason)
+		}
+
+		for _, reason := range orphanList.Pods {
+			orphanedPods = append(orphanedPods, reason)
+		}
+
+		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
+		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
+	}
+
+	if len(orphans) == 0 {
+		fmt.Printf("You don't have any problems, at all!\n")
+	} else {
+		if "text" == outputMode {
+			for namespace, orphanList := range orphans {
+				fmt.Printf("\n==============================\n")
+				fmt.Printf("Namespace: %s\n", namespace)
+				fmt.Printf("==============================\n")
+				if len(orphanList.Pods) > 0 {
+					fmt.Printf("\nOrphaned Pods\n")
+					for pod, reason := range orphanList.Pods {
+						fmt.Printf("* %s, %s\n", pod, reason)
+					}
+				}
+				if len(orphanList.Ingresses) > 0 {
+					fmt.Printf("\nOrphaned Ingresses\n")
+					for ingress, reason := range orphanList.Ingresses {
+						fmt.Printf("* %s, %s\n", ingress, reason)
+					}
+				}
+				fmt.Println()
+			}
+		} else if "yaml" == outputMode {
+			pretty, err := yaml.Marshal(&namespaceList)
+			if err != nil {
+				betterPanic(err.Error())
+			}
+			fmt.Println(string(pretty))
+		} else if "json" == outputMode {
+			pretty, err := json.MarshalIndent(namespaceList, "", "    ")
+			if err != nil {
+				betterPanic(err.Error())
+			}
+			fmt.Println(string(pretty))
+		}
+	}
+}
+
 func main() {
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 	var kubeconfig string
 	var outputMode string
+	namespace := ""
 	home := homeDir()
 	kubeConfigPath := ""
 	if home != "" {
@@ -91,20 +159,72 @@ func main() {
 				Usage:       "output format (yaml, json, kubectl)",
 				Destination: &outputMode,
 			},
+			&cli.StringFlag{
+				Name:        "n",
+				Aliases:     []string{"namespace", "namespaces"},
+				Value:       "",
+				Usage:       "limit to this namespace (all namespaces if blank)",
+				Destination: &namespace,
+			},
 		},
 		Commands: []*cli.Command{
 			{
-				Name:    "list",
-				Aliases: []string{"ls"},
-				Usage:   "list orphans",
+				Name:    "validate",
+				Aliases: []string{"val", "check"},
+				Usage:   "validate resources",
+				Subcommands: []*cli.Command{
+					{
+						Name:    "ns",
+						Aliases: []string{"namespace", "namespaces"},
+						Usage:   "validate namespace(s)",
+						Action: func(c *cli.Context) error {
+							orphans := validateNamespaces(kubeconfig)
+							printReport(orphans, outputMode)
+							return nil
+						},
+					},
+					{
+						Name:    "ing",
+						Aliases: []string{"ingress", "ingresses"},
+						Usage:   "validate ingress(s)",
+						Action: func(c *cli.Context) error {
+							orphans := validateIngresses(kubeconfig, namespace)
+							printReport(orphans, outputMode)
+							return nil
+						},
+					},
+					{
+						Name:    "svc",
+						Aliases: []string{"service", "services"},
+						Usage:   "validate service(s)",
+						Action: func(c *cli.Context) error {
+							orphans := validateServices(kubeconfig, namespace)
+							printReport(orphans, outputMode)
+							return nil
+						},
+					},
+					// {
+					// 	Name:    "dep",
+					// 	Aliases: []string{"deployment", "deployments"},
+					// 	Usage:   "validate deployment(s)",
+					// 	Action: func(c *cli.Context) error {
+					// 		orphans := validateDeployments(kubeconfig, namespace)
+					// 		printReport(orphans, outputMode)
+					// 		return nil
+					// 	},
+					// },
+				},
+
 				Action: func(c *cli.Context) error {
-					run(kubeconfig, outputMode)
+					//run(kubeconfig, outputMode)
+					fmt.Printf("Running validation...")
 					return nil
 				},
 			},
 		},
 		Action: func(c *cli.Context) error {
 			fmt.Println("For usage, run ./kube-cleanup -?")
+			cli.ShowAppHelp(c)
 
 			return errors.New("Command not specified")
 		},
@@ -120,13 +240,13 @@ func main() {
 
 }
 
-func run(kubeconfig string, outputMode string) {
+func getKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Println("Local configuration not found, trying in-cluster configuration.")
 		config, err = rest.InClusterConfig()
 		if err != nil {
-			betterPanic(err.Error())
+			return nil, err
 		}
 		inCluster = true
 	}
@@ -138,11 +258,17 @@ func run(kubeconfig string, outputMode string) {
 		log.Printf("Configured to run in out-of cluster mode.\n")
 	}
 
-	log.Printf("Starting kube-cleanup.\n")
-
 	clientset, err := kubernetes.NewForConfig(config)
+	return clientset, err
+}
 
-	ingresses, err := clientset.ExtensionsV1beta1().Ingresses("").List(metav1.ListOptions{})
+func validateIngresses(kubeconfig string, namespace string) map[string]OrphanList {
+	clientset, err := getKubernetesClient(kubeconfig)
+	if err != nil {
+		betterPanic(err.Error())
+	}
+
+	ingresses, err := clientset.ExtensionsV1beta1().Ingresses(namespace).List(metav1.ListOptions{})
 	if err != nil {
 		betterPanic(err.Error())
 	}
@@ -198,145 +324,322 @@ func run(kubeconfig string, outputMode string) {
 
 					continue
 				}
-
-				listOptions := metav1.ListOptions{}
-				listOptions.LabelSelector = labels.SelectorFromSet(service.Spec.Selector).String()
-
-				podList, err := clientset.CoreV1().Pods(ingress.Namespace).List(listOptions)
-
-				if err != nil {
-					orphanList := orphans[ingress.Namespace]
-					if orphanList.Ingresses == nil {
-						orphanList.Ingresses = make(map[string]OrphanReason)
-					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-					orphans[ingress.Namespace] = orphanList
-
-					continue
-				}
-
-				if len(podList.Items) == 0 {
-					orphanList := orphans[ingress.Namespace]
-					if orphanList.Ingresses == nil {
-						orphanList.Ingresses = make(map[string]OrphanReason)
-					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing workload contains no pods", Kind: "ingress", Reference: ResourceReference{Kind: "pods", Name: listOptions.LabelSelector}, Name: ingress.Name}
-					orphans[ingress.Namespace] = orphanList
-
-					continue
-				}
-
 			}
 		}
 	}
 	bar.Finish()
+	return orphans
+}
 
-	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
+func validateNamespaces(kubeconfig string) map[string]OrphanList {
+	orphans := make(map[string]OrphanList)
+
+	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
 		betterPanic(err.Error())
 	}
 
-	bar = pb.StartNew(len(pods.Items))
+	namespaces, err := clientset.CoreV1().Namespaces().List(metav1.ListOptions{})
+	if err != nil {
+		betterPanic(err.Error())
+	}
 
-	fmt.Printf("Examining orphaned pods.\n")
-	for _, pod := range pods.Items {
-		bar.Increment()
-		if "kube-system" == pod.Namespace {
+	for _, namespace := range namespaces.Items {
+		if namespace.Status.Phase == v1.NamespaceTerminating && contains("kubernetes", namespace.Finalizers) {
+			orphanList := orphans[namespace.Namespace]
+			if orphanList.Ingresses == nil {
+				orphanList.Ingresses = make(map[string]OrphanReason)
+			}
+			orphanList.Ingresses[namespace.Name] = OrphanReason{Reason: "stuck in termination", Kind: "ingress", Name: namespace.Namespace}
+			orphans[namespace.Namespace] = orphanList
+		}
+	}
+	return orphans
+}
+
+func validateServices(kubeconfig string, namespace string) map[string]OrphanList {
+	orphans := make(map[string]OrphanList)
+	clientset, err := getKubernetesClient(kubeconfig)
+	if err != nil {
+		betterPanic(err.Error())
+	}
+
+	services, err := clientset.CoreV1().Services(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		betterPanic(err.Error())
+	}
+
+	for _, service := range services.Items {
+		// No selector on the service, i.e. calls cannot be routed
+		if len(service.Spec.Selector) == 0 && service.Spec.Type != v1.ServiceTypeExternalName {
+			orphanList := orphans[service.Namespace]
+			if orphanList.Ingresses == nil {
+				orphanList.Ingresses = make(map[string]OrphanReason)
+			}
+			orphanList.Ingresses[service.Name] = OrphanReason{Reason: "no selector", Kind: "service", Name: service.Name}
+			orphans[service.Namespace] = orphanList
 			continue
 		}
 
-		ownerReferences := pod.GetObjectMeta().GetOwnerReferences()
-		for _, ownerReference := range ownerReferences {
-			if "ReplicaSet" == ownerReference.Kind {
-				rs, err := clientset.ExtensionsV1beta1().ReplicaSets(pod.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
-				if err != nil {
-					orphanList := orphans[pod.Namespace]
-					if orphanList.Pods == nil {
-						orphanList.Pods = make(map[string]OrphanReason)
-					}
-					orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner is missing", Name: pod.Name, Kind: "pod", Reference: ResourceReference{Kind: ownerReference.Kind, Name: ownerReference.Name}}
-					orphans[pod.Namespace] = orphanList
-
-					continue
-				} else {
-					for _, ownerReference := range rs.OwnerReferences {
-						if "Deployment" == ownerReference.Kind {
-							_, err := clientset.ExtensionsV1beta1().Deployments(rs.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
-							if err != nil {
-								orphanList := orphans[pod.Namespace]
-								if orphanList.Pods == nil {
-									orphanList.Pods = make(map[string]OrphanReason)
-								}
-								orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, Reference: ResourceReference{Kind: "deployment", Name: ownerReference.Name}}
-								orphans[pod.Namespace] = orphanList
-							}
-						}
-					}
+		if service.Spec.Type == v1.ServiceTypeLoadBalancer {
+			if len(service.Status.LoadBalancer.Ingress) == 0 {
+				orphanList := orphans[service.Namespace]
+				if orphanList.Ingresses == nil {
+					orphanList.Ingresses = make(map[string]OrphanReason)
 				}
+				orphanList.Ingresses[service.Name] = OrphanReason{Reason: "LoadBalancer service in pending state", Kind: "service", Name: service.Name}
+				orphans[service.Namespace] = orphanList
 			}
-		}
-		if len(ownerReferences) == 0 {
-			orphanList := orphans[pod.Namespace]
-			if orphanList.Pods == nil {
-				orphanList.Pods = make(map[string]OrphanReason)
-			}
-			orphanList.Pods[pod.Name] = OrphanReason{Reason: "pod is not owned by anyone", Name: pod.Name, Kind: "pod"}
-			orphans[pod.Namespace] = orphanList
-		}
-	}
-	bar.Finish()
-
-	namespaceList := NamespaceList{}
-	for namespace, orphanList := range orphans {
-		orphanedIngresses := make([]OrphanReason, 0)
-		orphanedPods := make([]OrphanReason, 0)
-
-		for _, reason := range orphanList.Ingresses {
-			orphanedIngresses = append(orphanedIngresses, reason)
+			continue
 		}
 
-		for _, reason := range orphanList.Pods {
-			orphanedPods = append(orphanedPods, reason)
-		}
-
-		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
-		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
-	}
-
-	if len(orphans) == 0 {
-		fmt.Printf("You don't have any problems, at all!\n")
-	} else {
-		if "text" == outputMode {
-			for namespace, orphanList := range orphans {
-				fmt.Printf("\n==============================\n")
-				fmt.Printf("Namespace: %s\n", namespace)
-				fmt.Printf("==============================\n")
-				if len(orphanList.Pods) > 0 {
-					fmt.Printf("\nOrphaned Pods\n")
-					for pod, reason := range orphanList.Pods {
-						fmt.Printf("* %s, %s\n", pod, reason)
-					}
+		if service.Spec.Type == v1.ServiceTypeExternalName {
+			if !isd.IsDomain(service.Spec.ExternalName) {
+				orphanList := orphans[service.Namespace]
+				if orphanList.Ingresses == nil {
+					orphanList.Ingresses = make(map[string]OrphanReason)
 				}
-				if len(orphanList.Ingresses) > 0 {
-					fmt.Printf("\nOrphaned Ingresses\n")
-					for ingress, reason := range orphanList.Ingresses {
-						fmt.Printf("* %s, %s\n", ingress, reason)
-					}
-				}
-				fmt.Println()
+				orphanList.Ingresses[service.Name] = OrphanReason{Reason: fmt.Sprintf("%s is not a valid CNAME", service.Spec.ExternalName), Kind: "service", Name: service.Name}
+				orphans[service.Namespace] = orphanList
 			}
-		} else if "yaml" == outputMode {
-			pretty, err := yaml.Marshal(&namespaceList)
-			if err != nil {
-				betterPanic(err.Error())
-			}
-			fmt.Println(string(pretty))
-		} else if "json" == outputMode {
-			pretty, err := json.MarshalIndent(namespaceList, "", "    ")
-			if err != nil {
-				betterPanic(err.Error())
-			}
-			fmt.Println(string(pretty))
+			continue
 		}
+
+		listOptions := metav1.ListOptions{}
+		listOptions.LabelSelector = labels.SelectorFromSet(service.Spec.Selector).String()
+
+		podList, err := clientset.CoreV1().Pods(namespace).List(listOptions)
+
+		if err != nil {
+			orphanList := orphans[namespace]
+			if orphanList.Ingresses == nil {
+				orphanList.Ingresses = make(map[string]OrphanReason)
+			}
+			orphanList.Ingresses[namespace] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "service", Name: service.Name}
+			orphans[namespace] = orphanList
+
+			continue
+		}
+
+		if len(podList.Items) == 0 {
+			orphanList := orphans[namespace]
+			if orphanList.Ingresses == nil {
+				orphanList.Ingresses = make(map[string]OrphanReason)
+			}
+			orphanList.Ingresses[namespace] = OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "workload", Name: listOptions.LabelSelector}, Name: service.Name}
+			orphans[namespace] = orphanList
+
+			continue
+		}
+
 	}
+	return orphans
 }
+
+// func run(kubeconfig string, outputMode string) {
+// 	clientset, err := getKubernetesClient(kubeconfig)
+// 	if err != nil {
+// 		betterPanic(err.Error())
+// 	}
+
+// 	ingresses, err := clientset.ExtensionsV1beta1().Ingresses("").List(metav1.ListOptions{})
+// 	if err != nil {
+// 		betterPanic(err.Error())
+// 	}
+
+// 	orphans := make(map[string]OrphanList)
+
+// 	fmt.Printf("Examining ingress rules.\n")
+// 	bar := pb.StartNew(len(ingresses.Items))
+// 	for _, ingress := range ingresses.Items {
+// 		bar.Increment()
+
+// 		for _, rule := range ingress.Spec.Rules {
+// 			if rule.HTTP == nil {
+// 				orphanList := orphans[ingress.Namespace]
+// 				if orphanList.Ingresses == nil {
+// 					orphanList.Ingresses = make(map[string]OrphanReason)
+// 				}
+// 				orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name}
+// 				orphans[ingress.Namespace] = orphanList
+// 				continue
+// 			}
+// 			for _, path := range rule.HTTP.Paths {
+
+// 				serviceName := path.Backend.ServiceName
+// 				servicePort := path.Backend.ServicePort.IntVal
+// 				service, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
+// 				if err != nil {
+// 					orphanList := orphans[ingress.Namespace]
+// 					if orphanList.Ingresses == nil {
+// 						orphanList.Ingresses = make(map[string]OrphanReason)
+// 					}
+// 					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 					orphans[ingress.Namespace] = orphanList
+
+// 					continue
+// 				}
+
+// 				found := false
+// 				for _, port := range service.Spec.Ports {
+// 					if port.Port == servicePort {
+// 						found = true
+// 						break
+// 					}
+// 				}
+
+// 				if !found {
+// 					orphanList := orphans[ingress.Namespace]
+// 					if orphanList.Ingresses == nil {
+// 						orphanList.Ingresses = make(map[string]OrphanReason)
+// 					}
+// 					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 					orphans[ingress.Namespace] = orphanList
+
+// 					continue
+// 				}
+
+// 				if len(service.Spec.Selector) > 0 {
+
+// 					listOptions := metav1.ListOptions{}
+// 					listOptions.LabelSelector = labels.SelectorFromSet(service.Spec.Selector).String()
+
+// 					podList, err := clientset.CoreV1().Pods(ingress.Namespace).List(listOptions)
+
+// 					if err != nil {
+// 						orphanList := orphans[ingress.Namespace]
+// 						if orphanList.Ingresses == nil {
+// 							orphanList.Ingresses = make(map[string]OrphanReason)
+// 						}
+// 						orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 						orphans[ingress.Namespace] = orphanList
+
+// 						continue
+// 					}
+
+// 					if len(podList.Items) == 0 {
+// 						orphanList := orphans[ingress.Namespace]
+// 						if orphanList.Ingresses == nil {
+// 							orphanList.Ingresses = make(map[string]OrphanReason)
+// 						}
+// 						orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing workload contains no pods", Kind: "ingress", Reference: ResourceReference{Kind: "pods", Name: listOptions.LabelSelector}, Name: ingress.Name}
+// 						orphans[ingress.Namespace] = orphanList
+
+// 						continue
+// 					}
+// 				}
+
+// 			}
+// 		}
+// 	}
+// 	bar.Finish()
+
+// 	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
+// 	if err != nil {
+// 		betterPanic(err.Error())
+// 	}
+
+// 	bar = pb.StartNew(len(pods.Items))
+
+// 	fmt.Printf("Examining orphaned pods.\n")
+// 	for _, pod := range pods.Items {
+// 		bar.Increment()
+// 		if "kube-system" == pod.Namespace {
+// 			continue
+// 		}
+
+// 		ownerReferences := pod.GetObjectMeta().GetOwnerReferences()
+// 		for _, ownerReference := range ownerReferences {
+// 			if "ReplicaSet" == ownerReference.Kind {
+// 				rs, err := clientset.ExtensionsV1beta1().ReplicaSets(pod.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
+// 				if err != nil {
+// 					orphanList := orphans[pod.Namespace]
+// 					if orphanList.Pods == nil {
+// 						orphanList.Pods = make(map[string]OrphanReason)
+// 					}
+// 					orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner is missing", Name: pod.Name, Kind: "pod", Reference: ResourceReference{Kind: ownerReference.Kind, Name: ownerReference.Name}}
+// 					orphans[pod.Namespace] = orphanList
+
+// 					continue
+// 				} else {
+// 					for _, ownerReference := range rs.OwnerReferences {
+// 						if "Deployment" == ownerReference.Kind {
+// 							_, err := clientset.ExtensionsV1beta1().Deployments(rs.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
+// 							if err != nil {
+// 								orphanList := orphans[pod.Namespace]
+// 								if orphanList.Pods == nil {
+// 									orphanList.Pods = make(map[string]OrphanReason)
+// 								}
+// 								orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, Reference: ResourceReference{Kind: "deployment", Name: ownerReference.Name}}
+// 								orphans[pod.Namespace] = orphanList
+// 							}
+// 						}
+// 					}
+// 				}
+// 			}
+// 		}
+// 		if len(ownerReferences) == 0 {
+// 			orphanList := orphans[pod.Namespace]
+// 			if orphanList.Pods == nil {
+// 				orphanList.Pods = make(map[string]OrphanReason)
+// 			}
+// 			orphanList.Pods[pod.Name] = OrphanReason{Reason: "pod is not owned by anyone", Name: pod.Name, Kind: "pod"}
+// 			orphans[pod.Namespace] = orphanList
+// 		}
+// 	}
+// 	bar.Finish()
+
+// 	namespaceList := NamespaceList{}
+// 	for namespace, orphanList := range orphans {
+// 		orphanedIngresses := make([]OrphanReason, 0)
+// 		orphanedPods := make([]OrphanReason, 0)
+
+// 		for _, reason := range orphanList.Ingresses {
+// 			orphanedIngresses = append(orphanedIngresses, reason)
+// 		}
+
+// 		for _, reason := range orphanList.Pods {
+// 			orphanedPods = append(orphanedPods, reason)
+// 		}
+
+// 		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
+// 		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
+// 	}
+
+// 	if len(orphans) == 0 {
+// 		fmt.Printf("You don't have any problems, at all!\n")
+// 	} else {
+// 		if "text" == outputMode {
+// 			for namespace, orphanList := range orphans {
+// 				fmt.Printf("\n==============================\n")
+// 				fmt.Printf("Namespace: %s\n", namespace)
+// 				fmt.Printf("==============================\n")
+// 				if len(orphanList.Pods) > 0 {
+// 					fmt.Printf("\nOrphaned Pods\n")
+// 					for pod, reason := range orphanList.Pods {
+// 						fmt.Printf("* %s, %s\n", pod, reason)
+// 					}
+// 				}
+// 				if len(orphanList.Ingresses) > 0 {
+// 					fmt.Printf("\nOrphaned Ingresses\n")
+// 					for ingress, reason := range orphanList.Ingresses {
+// 						fmt.Printf("* %s, %s\n", ingress, reason)
+// 					}
+// 				}
+// 				fmt.Println()
+// 			}
+// 		} else if "yaml" == outputMode {
+// 			pretty, err := yaml.Marshal(&namespaceList)
+// 			if err != nil {
+// 				betterPanic(err.Error())
+// 			}
+// 			fmt.Println(string(pretty))
+// 		} else if "json" == outputMode {
+// 			pretty, err := json.MarshalIndent(namespaceList, "", "    ")
+// 			if err != nil {
+// 				betterPanic(err.Error())
+// 			}
+// 			fmt.Println(string(pretty))
+// 		}
+// 	}
+// }
