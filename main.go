@@ -370,6 +370,9 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 	}
 
 	for _, service := range services.Items {
+		if "default" == service.Namespace && "kubernetes" == service.Name {
+			continue
+		}
 		// No selector on the service, i.e. calls cannot be routed
 		if len(service.Spec.Selector) == 0 && service.Spec.Type != v1.ServiceTypeExternalName {
 			orphanList := orphans[service.Namespace]
