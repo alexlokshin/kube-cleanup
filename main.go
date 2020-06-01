@@ -36,14 +36,12 @@ type OrphanReason struct {
 	Reason    string            `json:",omitempty" yaml:",omitempty"`
 }
 type OrphanList struct {
-	Pods      map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
-	Ingresses map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Items map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type Namespace struct {
-	Name      string         `json:",omitempty" yaml:",omitempty"`
-	Pods      []OrphanReason `json:",omitempty" yaml:",omitempty"`
-	Ingresses []OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Name  string         `json:",omitempty" yaml:",omitempty"`
+	Items []OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type NamespaceList struct {
@@ -77,18 +75,13 @@ func contains(s string, array []string) bool {
 func printReport(orphans map[string]OrphanList, outputMode string) {
 	namespaceList := NamespaceList{}
 	for namespace, orphanList := range orphans {
-		orphanedIngresses := make([]OrphanReason, 0)
-		orphanedPods := make([]OrphanReason, 0)
+		orphanedItems := make([]OrphanReason, 0)
 
-		for _, reason := range orphanList.Ingresses {
-			orphanedIngresses = append(orphanedIngresses, reason)
+		for _, reason := range orphanList.Items {
+			orphanedItems = append(orphanedItems, reason)
 		}
 
-		for _, reason := range orphanList.Pods {
-			orphanedPods = append(orphanedPods, reason)
-		}
-
-		ns := Namespace{Name: namespace, Ingresses: orphanedIngresses, Pods: orphanedPods}
+		ns := Namespace{Name: namespace, Items: orphanedItems}
 		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
 	}
 
@@ -100,15 +93,10 @@ func printReport(orphans map[string]OrphanList, outputMode string) {
 				fmt.Printf("\n==============================\n")
 				fmt.Printf("Namespace: %s\n", namespace)
 				fmt.Printf("==============================\n")
-				if len(orphanList.Pods) > 0 {
-					fmt.Printf("\nOrphaned Pods\n")
-					for pod, reason := range orphanList.Pods {
-						fmt.Printf("* %s, %s\n", pod, reason)
-					}
-				}
-				if len(orphanList.Ingresses) > 0 {
-					fmt.Printf("\nOrphaned Ingresses\n")
-					for ingress, reason := range orphanList.Ingresses {
+
+				if len(orphanList.Items) > 0 {
+					fmt.Printf("\nOrphaned Items\n")
+					for ingress, reason := range orphanList.Items {
 						fmt.Printf("* %s, %s\n", ingress, reason)
 					}
 				}
@@ -262,6 +250,15 @@ func getKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	return clientset, err
 }
 
+func addOrphanedReason(orphans map[string]OrphanList, namespace string, name string, reason OrphanReason) {
+	orphanList, ok := orphans[namespace]
+	if !ok {
+		orphanList = OrphanList{Items: make(map[string]OrphanReason)}
+	}
+	orphanList.Items[name] = reason
+	orphans[namespace] = orphanList
+}
+
 func validateIngresses(kubeconfig string, namespace string) map[string]OrphanList {
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
@@ -282,12 +279,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 
 		for _, rule := range ingress.Spec.Rules {
 			if rule.HTTP == nil {
-				orphanList := orphans[ingress.Namespace]
-				if orphanList.Ingresses == nil {
-					orphanList.Ingresses = make(map[string]OrphanReason)
-				}
-				orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name}
-				orphans[ingress.Namespace] = orphanList
+				addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name})
 				continue
 			}
 			for _, path := range rule.HTTP.Paths {
@@ -296,13 +288,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 				servicePort := path.Backend.ServicePort.IntVal
 				service, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
 				if err != nil {
-					orphanList := orphans[ingress.Namespace]
-					if orphanList.Ingresses == nil {
-						orphanList.Ingresses = make(map[string]OrphanReason)
-					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-					orphans[ingress.Namespace] = orphanList
-
+					addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
 					continue
 				}
 
@@ -315,13 +301,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 				}
 
 				if !found {
-					orphanList := orphans[ingress.Namespace]
-					if orphanList.Ingresses == nil {
-						orphanList.Ingresses = make(map[string]OrphanReason)
-					}
-					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-					orphans[ingress.Namespace] = orphanList
-
+					addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
 					continue
 				}
 			}
@@ -344,16 +324,15 @@ func validateNamespaces(kubeconfig string) map[string]OrphanList {
 		betterPanic(err.Error())
 	}
 
+	bar := pb.StartNew(len(namespaces.Items))
 	for _, namespace := range namespaces.Items {
+		bar.Increment()
 		if namespace.Status.Phase == v1.NamespaceTerminating && contains("kubernetes", namespace.Finalizers) {
-			orphanList := orphans[namespace.Namespace]
-			if orphanList.Ingresses == nil {
-				orphanList.Ingresses = make(map[string]OrphanReason)
-			}
-			orphanList.Ingresses[namespace.Name] = OrphanReason{Reason: "stuck in termination", Kind: "ingress", Name: namespace.Namespace}
-			orphans[namespace.Namespace] = orphanList
+			addOrphanedReason(orphans, namespace.Namespace, namespace.Name, OrphanReason{Reason: "stuck in termination", Kind: "ingress", Name: namespace.Namespace})
 		}
 	}
+	bar.Finish()
+
 	return orphans
 }
 
@@ -369,41 +348,30 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 		betterPanic(err.Error())
 	}
 
+	bar := pb.StartNew(len(services.Items))
 	for _, service := range services.Items {
+		bar.Increment()
 		if "default" == service.Namespace && "kubernetes" == service.Name {
 			continue
 		}
 		// No selector on the service, i.e. calls cannot be routed
 		if len(service.Spec.Selector) == 0 && service.Spec.Type != v1.ServiceTypeExternalName {
-			orphanList := orphans[service.Namespace]
-			if orphanList.Ingresses == nil {
-				orphanList.Ingresses = make(map[string]OrphanReason)
-			}
-			orphanList.Ingresses[service.Name] = OrphanReason{Reason: "no selector", Kind: "service", Name: service.Name}
-			orphans[service.Namespace] = orphanList
+			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "no selector", Kind: "service", Name: service.Name})
+
 			continue
 		}
 
 		if service.Spec.Type == v1.ServiceTypeLoadBalancer {
 			if len(service.Status.LoadBalancer.Ingress) == 0 {
-				orphanList := orphans[service.Namespace]
-				if orphanList.Ingresses == nil {
-					orphanList.Ingresses = make(map[string]OrphanReason)
-				}
-				orphanList.Ingresses[service.Name] = OrphanReason{Reason: "LoadBalancer service in pending state", Kind: "service", Name: service.Name}
-				orphans[service.Namespace] = orphanList
+				addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "LoadBalancer service in pending state", Kind: "service", Name: service.Name})
+
 			}
 			continue
 		}
 
 		if service.Spec.Type == v1.ServiceTypeExternalName {
 			if !isd.IsDomain(service.Spec.ExternalName) {
-				orphanList := orphans[service.Namespace]
-				if orphanList.Ingresses == nil {
-					orphanList.Ingresses = make(map[string]OrphanReason)
-				}
-				orphanList.Ingresses[service.Name] = OrphanReason{Reason: fmt.Sprintf("%s is not a valid CNAME", service.Spec.ExternalName), Kind: "service", Name: service.Name}
-				orphans[service.Namespace] = orphanList
+				addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: fmt.Sprintf("%s is not a valid CNAME", service.Spec.ExternalName), Kind: "service", Name: service.Name})
 			}
 			continue
 		}
@@ -414,28 +382,18 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 		podList, err := clientset.CoreV1().Pods(namespace).List(listOptions)
 
 		if err != nil {
-			orphanList := orphans[namespace]
-			if orphanList.Ingresses == nil {
-				orphanList.Ingresses = make(map[string]OrphanReason)
-			}
-			orphanList.Ingresses[namespace] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "service", Name: service.Name}
-			orphans[namespace] = orphanList
-
+			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "service", Name: service.Name})
 			continue
 		}
 
 		if len(podList.Items) == 0 {
-			orphanList := orphans[namespace]
-			if orphanList.Ingresses == nil {
-				orphanList.Ingresses = make(map[string]OrphanReason)
-			}
-			orphanList.Ingresses[namespace] = OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "workload", Name: listOptions.LabelSelector}, Name: service.Name}
-			orphans[namespace] = orphanList
+			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "workload", Name: listOptions.LabelSelector}, Name: service.Name})
 
 			continue
 		}
 
 	}
+	bar.Finish()
 	return orphans
 }
 
