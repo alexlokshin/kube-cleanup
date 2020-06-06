@@ -25,8 +25,9 @@ import (
 )
 
 type ResourceReference struct {
-	Name string `json:",omitempty" yaml:",omitempty"`
-	Kind string `json:",omitempty" yaml:",omitempty"`
+	Name          string `json:",omitempty" yaml:",omitempty"`
+	Kind          string `json:",omitempty" yaml:",omitempty"`
+	LabelSelector string `json:",omitempty" yaml:",omitempty"`
 }
 
 type OrphanReason struct {
@@ -35,13 +36,14 @@ type OrphanReason struct {
 	Reference ResourceReference `json:",omitempty" yaml:",omitempty"`
 	Reason    string            `json:",omitempty" yaml:",omitempty"`
 }
+
 type OrphanList struct {
 	Items map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type Namespace struct {
-	Name  string         `json:",omitempty" yaml:",omitempty"`
-	Items []OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Namespace string         `json:",omitempty" yaml:",omitempty"`
+	Items     []OrphanReason `json:",omitempty" yaml:",omitempty"`
 }
 
 type NamespaceList struct {
@@ -81,7 +83,7 @@ func printReport(orphans map[string]OrphanList, outputMode string) {
 			orphanedItems = append(orphanedItems, reason)
 		}
 
-		ns := Namespace{Name: namespace, Items: orphanedItems}
+		ns := Namespace{Namespace: namespace, Items: orphanedItems}
 		namespaceList.Namespaces = append(namespaceList.Namespaces, ns)
 	}
 
@@ -130,31 +132,33 @@ func main() {
 		kubeConfigPath = filepath.Join(home, ".kube", "config")
 	}
 
+	flags := []cli.Flag{
+		&cli.StringFlag{
+			Name:        "kubeconfig",
+			Value:       kubeConfigPath,
+			Usage:       "absolute path to the kubeconfig file",
+			Destination: &kubeconfig,
+		},
+		&cli.StringFlag{
+			Name:        "o",
+			Aliases:     []string{"output"},
+			Value:       "yaml",
+			Usage:       "output format (yaml, json, kubectl)",
+			Destination: &outputMode,
+		},
+		&cli.StringFlag{
+			Name:        "n",
+			Aliases:     []string{"namespace", "namespaces"},
+			Value:       "",
+			Usage:       "limit to this namespace (all namespaces if blank)",
+			Destination: &namespace,
+		},
+	}
+
 	app := &cli.App{
 		Name:  "kube-cleanup",
 		Usage: "kubernetes garbage collector",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "kubeconfig",
-				Value:       kubeConfigPath,
-				Usage:       "absolute path to the kubeconfig file",
-				Destination: &kubeconfig,
-			},
-			&cli.StringFlag{
-				Name:        "o",
-				Aliases:     []string{"output"},
-				Value:       "yaml",
-				Usage:       "output format (yaml, json, kubectl)",
-				Destination: &outputMode,
-			},
-			&cli.StringFlag{
-				Name:        "n",
-				Aliases:     []string{"namespace", "namespaces"},
-				Value:       "",
-				Usage:       "limit to this namespace (all namespaces if blank)",
-				Destination: &namespace,
-			},
-		},
+		Flags: flags,
 		Commands: []*cli.Command{
 			{
 				Name:    "validate",
@@ -165,6 +169,7 @@ func main() {
 						Name:    "ns",
 						Aliases: []string{"namespace", "namespaces"},
 						Usage:   "validate namespace(s)",
+						Flags:   flags,
 						Action: func(c *cli.Context) error {
 							orphans := validateNamespaces(kubeconfig)
 							printReport(orphans, outputMode)
@@ -175,6 +180,7 @@ func main() {
 						Name:    "ing",
 						Aliases: []string{"ingress", "ingresses"},
 						Usage:   "validate ingress(s)",
+						Flags:   flags,
 						Action: func(c *cli.Context) error {
 							orphans := validateIngresses(kubeconfig, namespace)
 							printReport(orphans, outputMode)
@@ -185,6 +191,7 @@ func main() {
 						Name:    "svc",
 						Aliases: []string{"service", "services"},
 						Usage:   "validate service(s)",
+						Flags:   flags,
 						Action: func(c *cli.Context) error {
 							orphans := validateServices(kubeconfig, namespace)
 							printReport(orphans, outputMode)
@@ -262,12 +269,12 @@ func addOrphanedReason(orphans map[string]OrphanList, namespace string, name str
 func validateIngresses(kubeconfig string, namespace string) map[string]OrphanList {
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	ingresses, err := clientset.ExtensionsV1beta1().Ingresses(namespace).List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	orphans := make(map[string]OrphanList)
@@ -316,12 +323,12 @@ func validateNamespaces(kubeconfig string) map[string]OrphanList {
 
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	namespaces, err := clientset.CoreV1().Namespaces().List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	bar := pb.StartNew(len(namespaces.Items))
@@ -340,12 +347,12 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 	orphans := make(map[string]OrphanList)
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	services, err := clientset.CoreV1().Services(namespace).List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic(err.Error())
+		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
 	bar := pb.StartNew(len(services.Items))
@@ -387,7 +394,7 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 		}
 
 		if len(podList.Items) == 0 {
-			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "workload", Name: listOptions.LabelSelector}, Name: service.Name})
+			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "pod", LabelSelector: listOptions.LabelSelector}, Name: service.Name})
 
 			continue
 		}
