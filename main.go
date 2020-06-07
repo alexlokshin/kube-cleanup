@@ -198,16 +198,17 @@ func main() {
 							return nil
 						},
 					},
-					// {
-					// 	Name:    "dep",
-					// 	Aliases: []string{"deployment", "deployments"},
-					// 	Usage:   "validate deployment(s)",
-					// 	Action: func(c *cli.Context) error {
-					// 		orphans := validateDeployments(kubeconfig, namespace)
-					// 		printReport(orphans, outputMode)
-					// 		return nil
-					// 	},
-					// },
+					{
+						Name:    "dep",
+						Aliases: []string{"deployment", "deployments"},
+						Usage:   "validate deployment(s)",
+						Flags:   flags,
+						Action: func(c *cli.Context) error {
+							orphans := validateDeployments(kubeconfig, namespace)
+							printReport(orphans, outputMode)
+							return nil
+						},
+					},
 				},
 
 				Action: func(c *cli.Context) error {
@@ -399,6 +400,37 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 			continue
 		}
 
+	}
+	bar.Finish()
+	return orphans
+}
+
+func validateDeployments(kubeconfig string, namespace string) map[string]OrphanList {
+	orphans := make(map[string]OrphanList)
+	clientset, err := getKubernetesClient(kubeconfig)
+	if err != nil {
+		betterPanic("Unable to connect to K8s: %s", err.Error())
+	}
+
+	deployments, err := clientset.ExtensionsV1beta1().Deployments(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		betterPanic("Unable to retrieve deployments: %s", err.Error())
+	}
+
+	bar := pb.StartNew(len(deployments.Items))
+	for _, deployment := range deployments.Items {
+		bar.Increment()
+
+		// No selector on the service, i.e. calls cannot be routed
+		if deployment.Status.Replicas == 0 {
+			addOrphanedReason(orphans, deployment.Namespace, deployment.Name, OrphanReason{Reason: "no running replicas within a deployment", Kind: "deployment", Name: deployment.Name})
+			continue
+		}
+
+		if len(deployment.Labels) == 0 {
+			addOrphanedReason(orphans, deployment.Namespace, deployment.Name, OrphanReason{Reason: "no labels on deployment", Kind: "deployment", Name: deployment.Name})
+			continue
+		}
 	}
 	bar.Finish()
 	return orphans
