@@ -274,7 +274,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 
 	ingresses, err := clientset.ExtensionsV1beta1().Ingresses(namespace).List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic("Unable to connect to K8s: %s", err.Error())
+		betterPanic("Unable to retrieve ingresses: %s", err.Error())
 	}
 
 	orphans := make(map[string]OrphanList)
@@ -328,7 +328,7 @@ func validateNamespaces(kubeconfig string) map[string]OrphanList {
 
 	namespaces, err := clientset.CoreV1().Namespaces().List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic("Unable to connect to K8s: %s", err.Error())
+		betterPanic("Unable to retrieve namespaces: %s", err.Error())
 	}
 
 	bar := pb.StartNew(len(namespaces.Items))
@@ -352,7 +352,7 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 
 	services, err := clientset.CoreV1().Services(namespace).List(metav1.ListOptions{})
 	if err != nil {
-		betterPanic("Unable to connect to K8s: %s", err.Error())
+		betterPanic("Unable to retrieve services: %s", err.Error())
 	}
 
 	bar := pb.StartNew(len(services.Items))
