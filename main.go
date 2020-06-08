@@ -16,6 +16,7 @@ import (
 	"github.com/cheggaaa/pb"
 	isd "github.com/jbenet/go-is-domain"
 	"gopkg.in/yaml.v2"
+	v1apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -30,20 +31,20 @@ type ResourceReference struct {
 	LabelSelector string `json:",omitempty" yaml:",omitempty"`
 }
 
-type OrphanReason struct {
+type InventoryViolation struct {
 	Name      string            `json:",omitempty" yaml:",omitempty"`
 	Kind      string            `json:",omitempty" yaml:",omitempty"`
 	Reference ResourceReference `json:",omitempty" yaml:",omitempty"`
 	Reason    string            `json:",omitempty" yaml:",omitempty"`
 }
 
-type OrphanList struct {
-	Items map[string]OrphanReason `json:",omitempty" yaml:",omitempty"`
+type ResourceInventoryList struct {
+	Items map[string]InventoryViolation `json:",omitempty" yaml:",omitempty"`
 }
 
 type Namespace struct {
-	Namespace string         `json:",omitempty" yaml:",omitempty"`
-	Items     []OrphanReason `json:",omitempty" yaml:",omitempty"`
+	Namespace string               `json:",omitempty" yaml:",omitempty"`
+	Items     []InventoryViolation `json:",omitempty" yaml:",omitempty"`
 }
 
 type NamespaceList struct {
@@ -74,12 +75,12 @@ func contains(s string, array []string) bool {
 	return false
 }
 
-func printReport(orphans map[string]OrphanList, outputMode string) {
+func printReport(orphans map[string]ResourceInventoryList, outputMode string) {
 	namespaceList := NamespaceList{}
-	for namespace, orphanList := range orphans {
-		orphanedItems := make([]OrphanReason, 0)
+	for namespace, ResourceInventoryList := range orphans {
+		orphanedItems := make([]InventoryViolation, 0)
 
-		for _, reason := range orphanList.Items {
+		for _, reason := range ResourceInventoryList.Items {
 			orphanedItems = append(orphanedItems, reason)
 		}
 
@@ -91,14 +92,14 @@ func printReport(orphans map[string]OrphanList, outputMode string) {
 		fmt.Printf("You don't have any problems, at all!\n")
 	} else {
 		if "text" == outputMode {
-			for namespace, orphanList := range orphans {
+			for namespace, ResourceInventoryList := range orphans {
 				fmt.Printf("\n==============================\n")
 				fmt.Printf("Namespace: %s\n", namespace)
 				fmt.Printf("==============================\n")
 
-				if len(orphanList.Items) > 0 {
+				if len(ResourceInventoryList.Items) > 0 {
 					fmt.Printf("\nOrphaned Items\n")
-					for ingress, reason := range orphanList.Items {
+					for ingress, reason := range ResourceInventoryList.Items {
 						fmt.Printf("* %s, %s\n", ingress, reason)
 					}
 				}
@@ -258,16 +259,16 @@ func getKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	return clientset, err
 }
 
-func addOrphanedReason(orphans map[string]OrphanList, namespace string, name string, reason OrphanReason) {
-	orphanList, ok := orphans[namespace]
+func addInventoryViolation(orphans map[string]ResourceInventoryList, namespace string, name string, reason InventoryViolation) {
+	inventoryList, ok := orphans[namespace]
 	if !ok {
-		orphanList = OrphanList{Items: make(map[string]OrphanReason)}
+		inventoryList = ResourceInventoryList{Items: make(map[string]InventoryViolation)}
 	}
-	orphanList.Items[name] = reason
-	orphans[namespace] = orphanList
+	inventoryList.Items[name] = reason
+	orphans[namespace] = inventoryList
 }
 
-func validateIngresses(kubeconfig string, namespace string) map[string]OrphanList {
+func validateIngresses(kubeconfig string, namespace string) map[string]ResourceInventoryList {
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
 		betterPanic("Unable to connect to K8s: %s", err.Error())
@@ -278,7 +279,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 		betterPanic("Unable to retrieve ingresses: %s", err.Error())
 	}
 
-	orphans := make(map[string]OrphanList)
+	orphans := make(map[string]ResourceInventoryList)
 
 	fmt.Printf("Examining ingress rules.\n")
 	bar := pb.StartNew(len(ingresses.Items))
@@ -287,7 +288,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 
 		for _, rule := range ingress.Spec.Rules {
 			if rule.HTTP == nil {
-				addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name})
+				addInventoryViolation(orphans, ingress.Namespace, ingress.Name, InventoryViolation{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name})
 				continue
 			}
 			for _, path := range rule.HTTP.Paths {
@@ -296,7 +297,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 				servicePort := path.Backend.ServicePort.IntVal
 				service, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
 				if err != nil {
-					addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
+					addInventoryViolation(orphans, ingress.Namespace, ingress.Name, InventoryViolation{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
 					continue
 				}
 
@@ -309,7 +310,7 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 				}
 
 				if !found {
-					addOrphanedReason(orphans, ingress.Namespace, ingress.Name, OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
+					addInventoryViolation(orphans, ingress.Namespace, ingress.Name, InventoryViolation{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name})
 					continue
 				}
 			}
@@ -319,8 +320,8 @@ func validateIngresses(kubeconfig string, namespace string) map[string]OrphanLis
 	return orphans
 }
 
-func validateNamespaces(kubeconfig string) map[string]OrphanList {
-	orphans := make(map[string]OrphanList)
+func validateNamespaces(kubeconfig string) map[string]ResourceInventoryList {
+	orphans := make(map[string]ResourceInventoryList)
 
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
@@ -336,7 +337,7 @@ func validateNamespaces(kubeconfig string) map[string]OrphanList {
 	for _, namespace := range namespaces.Items {
 		bar.Increment()
 		if namespace.Status.Phase == v1.NamespaceTerminating && contains("kubernetes", namespace.Finalizers) {
-			addOrphanedReason(orphans, namespace.Namespace, namespace.Name, OrphanReason{Reason: "stuck in termination", Kind: "ingress", Name: namespace.Namespace})
+			addInventoryViolation(orphans, namespace.Namespace, namespace.Name, InventoryViolation{Reason: "stuck in termination", Kind: "ingress", Name: namespace.Namespace})
 		}
 	}
 	bar.Finish()
@@ -344,8 +345,8 @@ func validateNamespaces(kubeconfig string) map[string]OrphanList {
 	return orphans
 }
 
-func validateServices(kubeconfig string, namespace string) map[string]OrphanList {
-	orphans := make(map[string]OrphanList)
+func validateServices(kubeconfig string, namespace string) map[string]ResourceInventoryList {
+	orphans := make(map[string]ResourceInventoryList)
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
 		betterPanic("Unable to connect to K8s: %s", err.Error())
@@ -364,14 +365,14 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 		}
 		// No selector on the service, i.e. calls cannot be routed
 		if len(service.Spec.Selector) == 0 && service.Spec.Type != v1.ServiceTypeExternalName {
-			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "no selector", Kind: "service", Name: service.Name})
+			addInventoryViolation(orphans, service.Namespace, service.Name, InventoryViolation{Reason: "no selector", Kind: "service", Name: service.Name})
 
 			continue
 		}
 
 		if service.Spec.Type == v1.ServiceTypeLoadBalancer {
 			if len(service.Status.LoadBalancer.Ingress) == 0 {
-				addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "LoadBalancer service in pending state", Kind: "service", Name: service.Name})
+				addInventoryViolation(orphans, service.Namespace, service.Name, InventoryViolation{Reason: "LoadBalancer service in pending state", Kind: "service", Name: service.Name})
 
 			}
 			continue
@@ -379,7 +380,7 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 
 		if service.Spec.Type == v1.ServiceTypeExternalName {
 			if !isd.IsDomain(service.Spec.ExternalName) {
-				addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: fmt.Sprintf("%s is not a valid CNAME", service.Spec.ExternalName), Kind: "service", Name: service.Name})
+				addInventoryViolation(orphans, service.Namespace, service.Name, InventoryViolation{Reason: fmt.Sprintf("%s is not a valid CNAME", service.Spec.ExternalName), Kind: "service", Name: service.Name})
 			}
 			continue
 		}
@@ -390,12 +391,12 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 		podList, err := clientset.CoreV1().Pods(namespace).List(listOptions)
 
 		if err != nil {
-			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "service", Name: service.Name})
+			addInventoryViolation(orphans, service.Namespace, service.Name, InventoryViolation{Reason: "backing service references no workloads: " + err.Error(), Kind: "service", Name: service.Name})
 			continue
 		}
 
 		if len(podList.Items) == 0 {
-			addOrphanedReason(orphans, service.Namespace, service.Name, OrphanReason{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "pod", LabelSelector: listOptions.LabelSelector}, Name: service.Name})
+			addInventoryViolation(orphans, service.Namespace, service.Name, InventoryViolation{Reason: "backing workload contains no pods", Kind: "service", Reference: ResourceReference{Kind: "pod", LabelSelector: listOptions.LabelSelector}, Name: service.Name})
 
 			continue
 		}
@@ -405,14 +406,14 @@ func validateServices(kubeconfig string, namespace string) map[string]OrphanList
 	return orphans
 }
 
-func validateDeployments(kubeconfig string, namespace string) map[string]OrphanList {
-	orphans := make(map[string]OrphanList)
+func validateDeployments(kubeconfig string, namespace string) map[string]ResourceInventoryList {
+	orphans := make(map[string]ResourceInventoryList)
 	clientset, err := getKubernetesClient(kubeconfig)
 	if err != nil {
 		betterPanic("Unable to connect to K8s: %s", err.Error())
 	}
 
-	deployments, err := clientset.ExtensionsV1beta1().Deployments(namespace).List(metav1.ListOptions{})
+	deployments, err := clientset.AppsV1().Deployments(namespace).List(metav1.ListOptions{})
 	if err != nil {
 		betterPanic("Unable to retrieve deployments: %s", err.Error())
 	}
@@ -423,12 +424,29 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 
 		// No selector on the service, i.e. calls cannot be routed
 		if deployment.Status.Replicas == 0 {
-			addOrphanedReason(orphans, deployment.Namespace, deployment.Name, OrphanReason{Reason: "no running replicas within a deployment", Kind: "deployment", Name: deployment.Name})
+			addInventoryViolation(orphans, deployment.Namespace, deployment.Name, InventoryViolation{Reason: "deployment scaled down to 0 replicas", Kind: "deployment", Name: deployment.Name})
 			continue
 		}
 
 		if len(deployment.Labels) == 0 {
-			addOrphanedReason(orphans, deployment.Namespace, deployment.Name, OrphanReason{Reason: "no labels on deployment", Kind: "deployment", Name: deployment.Name})
+			addInventoryViolation(orphans, deployment.Namespace, deployment.Name, InventoryViolation{Reason: "no labels on deployment", Kind: "deployment", Name: deployment.Name})
+			continue
+		}
+
+		for _, condition := range deployment.Status.Conditions {
+			if condition.Type == v1apps.DeploymentAvailable && condition.Status == "False" && condition.Reason == "MinimumReplicasUnavailable" {
+				addInventoryViolation(orphans, deployment.Namespace, deployment.Name, InventoryViolation{Reason: "minimum replicas unavailable, could be temporary", Kind: "deployment", Name: deployment.Name})
+				continue
+			}
+
+			if condition.Type == v1apps.DeploymentProgressing && condition.Status == "False" && condition.Reason == "ProgressDeadlineExceeded" {
+				fmt.Printf("%v\n", condition)
+				addInventoryViolation(orphans, deployment.Namespace, deployment.Name, InventoryViolation{Reason: condition.Message, Kind: "deployment", Name: deployment.Name})
+				continue
+			}
+		}
+		if deployment.Status.ReadyReplicas == 0 {
+			addInventoryViolation(orphans, deployment.Namespace, deployment.Name, InventoryViolation{Reason: "no replicas are ready", Kind: "deployment", Name: deployment.Name})
 			continue
 		}
 	}
@@ -447,7 +465,7 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 		betterPanic(err.Error())
 // 	}
 
-// 	orphans := make(map[string]OrphanList)
+// 	orphans := make(map[string]ResourceInventoryList)
 
 // 	fmt.Printf("Examining ingress rules.\n")
 // 	bar := pb.StartNew(len(ingresses.Items))
@@ -456,12 +474,12 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 
 // 		for _, rule := range ingress.Spec.Rules {
 // 			if rule.HTTP == nil {
-// 				orphanList := orphans[ingress.Namespace]
-// 				if orphanList.Ingresses == nil {
-// 					orphanList.Ingresses = make(map[string]OrphanReason)
+// 				ResourceInventoryList := orphans[ingress.Namespace]
+// 				if ResourceInventoryList.Ingresses == nil {
+// 					ResourceInventoryList.Ingresses = make(map[string]InventoryViolation)
 // 				}
-// 				orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name}
-// 				orphans[ingress.Namespace] = orphanList
+// 				ResourceInventoryList.Ingresses[ingress.Name] = InventoryViolation{Reason: "no HTTP routes in ingress", Kind: "ingress", Name: ingress.Name}
+// 				orphans[ingress.Namespace] = ResourceInventoryList
 // 				continue
 // 			}
 // 			for _, path := range rule.HTTP.Paths {
@@ -470,12 +488,12 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 				servicePort := path.Backend.ServicePort.IntVal
 // 				service, err := clientset.CoreV1().Services(ingress.Namespace).Get(serviceName, metav1.GetOptions{})
 // 				if err != nil {
-// 					orphanList := orphans[ingress.Namespace]
-// 					if orphanList.Ingresses == nil {
-// 						orphanList.Ingresses = make(map[string]OrphanReason)
+// 					ResourceInventoryList := orphans[ingress.Namespace]
+// 					if ResourceInventoryList.Ingresses == nil {
+// 						ResourceInventoryList.Ingresses = make(map[string]InventoryViolation)
 // 					}
-// 					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-// 					orphans[ingress.Namespace] = orphanList
+// 					ResourceInventoryList.Ingresses[ingress.Name] = InventoryViolation{Reason: "references a missing service: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 					orphans[ingress.Namespace] = ResourceInventoryList
 
 // 					continue
 // 				}
@@ -489,12 +507,12 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 				}
 
 // 				if !found {
-// 					orphanList := orphans[ingress.Namespace]
-// 					if orphanList.Ingresses == nil {
-// 						orphanList.Ingresses = make(map[string]OrphanReason)
+// 					ResourceInventoryList := orphans[ingress.Namespace]
+// 					if ResourceInventoryList.Ingresses == nil {
+// 						ResourceInventoryList.Ingresses = make(map[string]InventoryViolation)
 // 					}
-// 					orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-// 					orphans[ingress.Namespace] = orphanList
+// 					ResourceInventoryList.Ingresses[ingress.Name] = InventoryViolation{Reason: fmt.Sprintf("Service doesn't expose ingress port %d", servicePort), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 					orphans[ingress.Namespace] = ResourceInventoryList
 
 // 					continue
 // 				}
@@ -507,23 +525,23 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 					podList, err := clientset.CoreV1().Pods(ingress.Namespace).List(listOptions)
 
 // 					if err != nil {
-// 						orphanList := orphans[ingress.Namespace]
-// 						if orphanList.Ingresses == nil {
-// 							orphanList.Ingresses = make(map[string]OrphanReason)
+// 						ResourceInventoryList := orphans[ingress.Namespace]
+// 						if ResourceInventoryList.Ingresses == nil {
+// 							ResourceInventoryList.Ingresses = make(map[string]InventoryViolation)
 // 						}
-// 						orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing service references no workloads: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
-// 						orphans[ingress.Namespace] = orphanList
+// 						ResourceInventoryList.Ingresses[ingress.Name] = InventoryViolation{Reason: "backing service references no workloads: " + err.Error(), Kind: "ingress", Reference: ResourceReference{Kind: "service", Name: serviceName}, Name: ingress.Name}
+// 						orphans[ingress.Namespace] = ResourceInventoryList
 
 // 						continue
 // 					}
 
 // 					if len(podList.Items) == 0 {
-// 						orphanList := orphans[ingress.Namespace]
-// 						if orphanList.Ingresses == nil {
-// 							orphanList.Ingresses = make(map[string]OrphanReason)
+// 						ResourceInventoryList := orphans[ingress.Namespace]
+// 						if ResourceInventoryList.Ingresses == nil {
+// 							ResourceInventoryList.Ingresses = make(map[string]InventoryViolation)
 // 						}
-// 						orphanList.Ingresses[ingress.Name] = OrphanReason{Reason: "backing workload contains no pods", Kind: "ingress", Reference: ResourceReference{Kind: "pods", Name: listOptions.LabelSelector}, Name: ingress.Name}
-// 						orphans[ingress.Namespace] = orphanList
+// 						ResourceInventoryList.Ingresses[ingress.Name] = InventoryViolation{Reason: "backing workload contains no pods", Kind: "ingress", Reference: ResourceReference{Kind: "pods", Name: listOptions.LabelSelector}, Name: ingress.Name}
+// 						orphans[ingress.Namespace] = ResourceInventoryList
 
 // 						continue
 // 					}
@@ -553,12 +571,12 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 			if "ReplicaSet" == ownerReference.Kind {
 // 				rs, err := clientset.ExtensionsV1beta1().ReplicaSets(pod.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
 // 				if err != nil {
-// 					orphanList := orphans[pod.Namespace]
-// 					if orphanList.Pods == nil {
-// 						orphanList.Pods = make(map[string]OrphanReason)
+// 					ResourceInventoryList := orphans[pod.Namespace]
+// 					if ResourceInventoryList.Pods == nil {
+// 						ResourceInventoryList.Pods = make(map[string]InventoryViolation)
 // 					}
-// 					orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner is missing", Name: pod.Name, Kind: "pod", Reference: ResourceReference{Kind: ownerReference.Kind, Name: ownerReference.Name}}
-// 					orphans[pod.Namespace] = orphanList
+// 					ResourceInventoryList.Pods[pod.Name] = InventoryViolation{Reason: "owner is missing", Name: pod.Name, Kind: "pod", Reference: ResourceReference{Kind: ownerReference.Kind, Name: ownerReference.Name}}
+// 					orphans[pod.Namespace] = ResourceInventoryList
 
 // 					continue
 // 				} else {
@@ -566,12 +584,12 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 						if "Deployment" == ownerReference.Kind {
 // 							_, err := clientset.ExtensionsV1beta1().Deployments(rs.Namespace).Get(ownerReference.Name, metav1.GetOptions{})
 // 							if err != nil {
-// 								orphanList := orphans[pod.Namespace]
-// 								if orphanList.Pods == nil {
-// 									orphanList.Pods = make(map[string]OrphanReason)
+// 								ResourceInventoryList := orphans[pod.Namespace]
+// 								if ResourceInventoryList.Pods == nil {
+// 									ResourceInventoryList.Pods = make(map[string]InventoryViolation)
 // 								}
-// 								orphanList.Pods[pod.Name] = OrphanReason{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, Reference: ResourceReference{Kind: "deployment", Name: ownerReference.Name}}
-// 								orphans[pod.Namespace] = orphanList
+// 								ResourceInventoryList.Pods[pod.Name] = InventoryViolation{Reason: "owner of the owner is missing", Kind: "pod", Name: pod.Name, Reference: ResourceReference{Kind: "deployment", Name: ownerReference.Name}}
+// 								orphans[pod.Namespace] = ResourceInventoryList
 // 							}
 // 						}
 // 					}
@@ -579,26 +597,26 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 			}
 // 		}
 // 		if len(ownerReferences) == 0 {
-// 			orphanList := orphans[pod.Namespace]
-// 			if orphanList.Pods == nil {
-// 				orphanList.Pods = make(map[string]OrphanReason)
+// 			ResourceInventoryList := orphans[pod.Namespace]
+// 			if ResourceInventoryList.Pods == nil {
+// 				ResourceInventoryList.Pods = make(map[string]InventoryViolation)
 // 			}
-// 			orphanList.Pods[pod.Name] = OrphanReason{Reason: "pod is not owned by anyone", Name: pod.Name, Kind: "pod"}
-// 			orphans[pod.Namespace] = orphanList
+// 			ResourceInventoryList.Pods[pod.Name] = InventoryViolation{Reason: "pod is not owned by anyone", Name: pod.Name, Kind: "pod"}
+// 			orphans[pod.Namespace] = ResourceInventoryList
 // 		}
 // 	}
 // 	bar.Finish()
 
 // 	namespaceList := NamespaceList{}
-// 	for namespace, orphanList := range orphans {
-// 		orphanedIngresses := make([]OrphanReason, 0)
-// 		orphanedPods := make([]OrphanReason, 0)
+// 	for namespace, ResourceInventoryList := range orphans {
+// 		orphanedIngresses := make([]InventoryViolation, 0)
+// 		orphanedPods := make([]InventoryViolation, 0)
 
-// 		for _, reason := range orphanList.Ingresses {
+// 		for _, reason := range ResourceInventoryList.Ingresses {
 // 			orphanedIngresses = append(orphanedIngresses, reason)
 // 		}
 
-// 		for _, reason := range orphanList.Pods {
+// 		for _, reason := range ResourceInventoryList.Pods {
 // 			orphanedPods = append(orphanedPods, reason)
 // 		}
 
@@ -610,19 +628,19 @@ func validateDeployments(kubeconfig string, namespace string) map[string]OrphanL
 // 		fmt.Printf("You don't have any problems, at all!\n")
 // 	} else {
 // 		if "text" == outputMode {
-// 			for namespace, orphanList := range orphans {
+// 			for namespace, ResourceInventoryList := range orphans {
 // 				fmt.Printf("\n==============================\n")
 // 				fmt.Printf("Namespace: %s\n", namespace)
 // 				fmt.Printf("==============================\n")
-// 				if len(orphanList.Pods) > 0 {
+// 				if len(ResourceInventoryList.Pods) > 0 {
 // 					fmt.Printf("\nOrphaned Pods\n")
-// 					for pod, reason := range orphanList.Pods {
+// 					for pod, reason := range ResourceInventoryList.Pods {
 // 						fmt.Printf("* %s, %s\n", pod, reason)
 // 					}
 // 				}
-// 				if len(orphanList.Ingresses) > 0 {
+// 				if len(ResourceInventoryList.Ingresses) > 0 {
 // 					fmt.Printf("\nOrphaned Ingresses\n")
-// 					for ingress, reason := range orphanList.Ingresses {
+// 					for ingress, reason := range ResourceInventoryList.Ingresses {
 // 						fmt.Printf("* %s, %s\n", ingress, reason)
 // 					}
 // 				}
